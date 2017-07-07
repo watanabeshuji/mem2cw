@@ -1,0 +1,105 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Put Memory usage to CloudWatch from Lambda logs
+Parameters:
+  Namespace:
+    Type: String
+    Description: Namespace for CloudWatch Metric
+    Default: "Classmethod/Lambda"
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Basic
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: CloudWatch
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+  PutMetricDataWhenFindMemoryInfo:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Find memory info and Put Metric to CloudWatch
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs6.10
+      MemorySize: 128
+      Timeout: 3
+      Handler: index.handler
+      Code:
+        ZipFile: !Sub |
+          var zlib = require('zlib');
+          var aws = require('aws-sdk');
+          var cloudwatch = new aws.CloudWatch({ region: 'ap-northeast-1' });
+          exports.handler = function(input, context, callback) {
+            var data = new Buffer(input.awslogs.data, 'base64');
+            zlib.gunzip(data, function(e, result) {
+              if (e) {
+                callback(e);
+              } else {
+                result = JSON.parse(result.toString('utf-8'));
+                var functionName = result['logGroup'].split('/').pop(); // /aws/lambda/[functionName];
+                var metricData = result['logEvents']
+                                   .map(function(evt) {
+                                     var match = evt['message'].match(/^REPORT.+Memory Size: (\d+) MB\sMax Memory Used: (\d+) MB/);
+                                     if (match === null) return null;
+                                     return {
+                                        MetricName: 'MemoryUtilization',
+                                        Dimensions: [
+                                          {
+                                            Name: 'FunctionName',
+                                            Value: functionName
+                                          }
+                                        ],
+                                        Unit: 'Percent',
+                                        Value: 100.0 * Number(match[2]) / Number(match[1])
+                                     };
+                                   })
+                                   .filter(function(data) { return (data !== null);})
+                if (metricData.length === 0) {
+                  callback();
+                  return;
+                }
+                console.log(functionName, metricData);
+                cloudwatch.putMetricData({
+                  Namespace: '${Namespace}',
+                  MetricData: metricData
+                }, function(err, data) {
+                  if (err) callback(err);
+                  else callback(null, data);
+                });
+              }
+            });
+          };
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PutMetricDataWhenFindMemoryInfo.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.ap-northeast-1.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:logs:ap-northeast-1:${AWS::AccountId}:*
+Outputs:
+  LambdaFunction:
+    Description: arn about lambda function
+    Value: !GetAtt PutMetricDataWhenFindMemoryInfo.Arn
